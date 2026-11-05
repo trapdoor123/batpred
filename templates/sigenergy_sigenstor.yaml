@@ -69,8 +69,11 @@ pred_bat:
     - sensor.sigen_inverter_battery_average_cell_temperature
   battery_min_soc:
     - 0
+  # Backup SoC is the plant's floor while the grid is up (with a Sigen Gateway), so it is Predbat's reserve.
+  # The discharge cut-off is the floor in a grid outage: don't use it here, as the plant raises Backup SoC to match it.
+  # Without a Gateway, use number.sigen_plant_ess_discharge_cut_off_state_of_charge instead
   reserve:
-    - number.sigen_plant_ess_discharge_cut_off_state_of_charge
+    - number.sigen_plant_ess_backup_state_of_charge
   charge_limit:
     - number.sigen_plant_ess_charge_cut_off_state_of_charge
 

@@ -1946,6 +1946,21 @@ To integrate your Sigenergy Sigenstor inverter with Predbat, you will need to fo
 - Turn on **switch.sigen_plant_remote_ems_controlled_by_home_assistant** ("Remote EMS (Controlled by Home Assistant)"). While it is off the plant ignores **select.sigen_plant_remote_ems_control_mode** entirely and runs its own logic,
 so none of the mode changes made by the automations below take effect. The cut-off and limit numbers are still obeyed without it, which can make a setup look partly working.
 
+- The plant has two SoC floors, and the automations below use only one of them:
+
+    - **number.sigen_plant_ess_backup_state_of_charge** ("Backup SoC") is where the battery stops discharging while the grid is up. The automations hold the battery here for Freeze Charging,
+      and otherwise keep it at **input_number.predbat_set_reserve_min**, so set your reserve in Predbat rather than in the Sigenergy app (the automations would overwrite an app change).
+    - **number.sigen_plant_ess_discharge_cut_off_state_of_charge** ("Discharge Cut-Off SoC") is the floor in a grid outage, when the Sigen Gateway powers the house from the battery.
+      The automations never write it: set it once to the lowest level you want the battery to reach in an outage (Sigenergy recommend at least 5%), and keep **input_number.predbat_set_reserve_min** at or above it.
+      The plant keeps the discharge cut-off at or below Backup SoC, and raises Backup SoC itself if the cut-off is set above it.
+
+    Using Backup SoC this way needs a **Sigen Gateway**: without one, Sigenergy say the battery stops on-grid discharging at the discharge cut-off, and Backup SoC has no effect.
+    Without a Gateway, use **number.sigen_plant_ess_discharge_cut_off_state_of_charge** in place of **number.sigen_plant_ess_backup_state_of_charge** in the mode automation and in `apps.yaml`.
+
+- If you are updating from an earlier version of this page, whose automation pinned the discharge cut-off for Freeze Charging: set **number.sigen_plant_ess_discharge_cut_off_state_of_charge** back to your outage floor once,
+  as the old automation left it at 0. Backup SoC needs no manual fix: the new automation sets it back to your reserve on the next mode change.
+  The old automation cut off battery power in an outage during Freeze Charging, since the cut-off sat at the current SoC, and could leave Backup SoC raised to that level after the freeze, so the battery stopped discharging there until it was reset by hand.
+
 - The following additions are needed to facilitate integration with Predbat and need to be put into Home Assistant's `configuration.yaml` or configured via the HA user interface.
 They deliberately have no `initial:` value, so Home Assistant restores their last state on a restart. With `initial:` they are reset on every restart without a state change,
 so the automations below don't fire and the plant can be left in a mode, or at a rate limit, that no longer matches what Predbat sees.
@@ -2027,6 +2042,14 @@ Add the following automations to `automations.yaml` (or configure via the UI):
              else "Maximum Self Consumption" if is_state('input_select.predbat_requested_mode', "Freeze Charging")
              else "Command Discharging (PV First)" if is_state('input_select.predbat_requested_mode', "Discharging")
              else "Maximum Self Consumption" }}
+    # The SoC floors used below:
+    #  - backup_state_of_charge is the floor while the grid is up (with a Sigen Gateway). Predbat's freeze
+    #    is applied here, and it is otherwise kept at input_number.predbat_set_reserve_min.
+    #  - discharge_cut_off_state_of_charge is the floor in a grid outage. These automations never write it:
+    #    set it once, to the lowest level you want the battery to reach in an outage.
+    # The plant keeps discharge cut-off <= backup SoC, and raises backup SoC itself when the cut-off is set
+    # above it. So pinning the discharge cut-off for a freeze (as earlier versions of this page did) also
+    # left backup SoC raised after the freeze ended, and the battery then stopped discharging there.
     - choose:
         # Freeze Charging
         # Docs:
@@ -2036,17 +2059,10 @@ Add the following automations to `automations.yaml` (or configure via the UI):
         #  power above the house load, the excess solar will be used to charge the battery
         # In Sigenergy, this is effectively "self consumption" mode with discharging prohibited
         #
-        # discharge_cut_off_state_of_charge is pinned once here, to current SoC minus a small
-        # margin, not a hardcoded value and not continuously re-pinned. Sigenergy has confirmed a
-        # firmware bug: if this is set above current SoC, the inverter actively imports from grid
-        # to reach it - even if grid_import_limitation is set to 0 - so the target must never sit
-        # above SoC. Setting it once, fixed, is what actually implements "frozen": any real deficit
-        # against that fixed point (house load, or even the inverter's own standby losses) gets
-        # corrected by grid import back up to the target, rather than the target chasing SoC
-        # downward and never enforcing anything. The small margin exists only to stop ordinary
-        # sensor-reading noise around the target from triggering a real (if tiny) grid import to
-        # "correct" a fluctuation that was never a real deficit - see the note after this
-        # automation for the full reasoning.
+        # backup_state_of_charge is pinned once here, to current SoC minus a small margin, and never
+        # below predbat_set_reserve_min. With the grid up the plant imports to bring the battery back up
+        # to backup SoC, so the target must never sit above SoC - see the notes after this automation.
+        # If the grid fails, the battery can still discharge down to the discharge cut-off.
         - conditions:
             - condition: state
               entity_id: input_select.predbat_requested_mode
@@ -2059,11 +2075,15 @@ Add the following automations to `automations.yaml` (or configure via the UI):
                 value: 100
             - action: number.set_value
               target:
-                entity_id: number.sigen_plant_ess_discharge_cut_off_state_of_charge
-              data_template:
-                # If SoC can't be read this falls back to 0 (no discharge block) - never to a high
-                # value, which would trigger the forced-import bug described above
-                value: "{{ [(states('sensor.sigen_plant_battery_state_of_charge') | float(0)) - 0.25, 0] | max }}"
+                entity_id: number.sigen_plant_ess_backup_state_of_charge
+              data:
+                # If predbat_set_reserve_min can't be read, the current backup SoC is kept; if SoC can't be
+                # read, backup SoC is set to the reserve (no discharge block) - never to a guessed high value
+                value: >-
+                  {% set current_backup = states('number.sigen_plant_ess_backup_state_of_charge') | float(0) %}
+                  {% set min_reserve = states('input_number.predbat_set_reserve_min') | float(current_backup) %}
+                  {% set soc = states('sensor.sigen_plant_battery_state_of_charge') | float(none) %}
+                  {% if soc is not none %}{{ [soc - 0.2, min_reserve] | max | round(1) }}{% else %}{{ min_reserve }}{% endif %}
         # grid_import_limitation is deliberately not set to 0 in either freeze mode - see the note
         # after these automations.
         # Freeze Discharging
@@ -2075,9 +2095,9 @@ Add the following automations to `automations.yaml` (or configure via the UI):
         # In Sigenergy, this is effectively "self consumption" mode with charging prohibited
         #
         # charge_cut_off_state_of_charge is left as a simple hardcoded 0 here, unlike the
-        # discharge cut-off above. A mirrored bug (SoC above charge_cut_off forcing extra
+        # backup SoC above. A mirrored bug (SoC above charge_cut_off forcing extra
         # discharge/export) was considered - 0 is always below current SoC by the same
-        # structural shape as the confirmed discharge-side bug - but it was never
+        # structural shape as the discharge-side behaviour - but it was never
         # vendor-confirmed, and 0 has been in real use across the wider community template
         # for months without anyone reporting the kind of dramatic, easily-noticed symptom
         # a real mirrored bug would produce. Kept simple rather than adding unproven complexity.
@@ -2093,10 +2113,12 @@ Add the following automations to `automations.yaml` (or configure via the UI):
                 value: 0
             - action: number.set_value
               target:
-                entity_id: number.sigen_plant_ess_discharge_cut_off_state_of_charge
+                entity_id: number.sigen_plant_ess_backup_state_of_charge
               data:
-                value: 0
-        # Any other mode: clear the freeze cut-offs and restore the import limit
+                value: >-
+                  {% set current_backup = states('number.sigen_plant_ess_backup_state_of_charge') | float(0) %}
+                  {{ states('input_number.predbat_set_reserve_min') | float(current_backup) }}
+        # Any other mode: clear the freeze, return backup SoC to the reserve and restore the import limit
         - conditions:
           - condition: not
             conditions:
@@ -2114,9 +2136,11 @@ Add the following automations to `automations.yaml` (or configure via the UI):
                 value: 100
             - action: number.set_value
               target:
-                entity_id: number.sigen_plant_ess_discharge_cut_off_state_of_charge
+                entity_id: number.sigen_plant_ess_backup_state_of_charge
               data:
-                value: 0
+                value: >-
+                  {% set current_backup = states('number.sigen_plant_ess_backup_state_of_charge') | float(0) %}
+                  {{ states('input_number.predbat_set_reserve_min') | float(current_backup) }}
             - action: number.set_value
               target:
                 entity_id: number.sigen_plant_grid_import_limitation
@@ -2201,15 +2225,15 @@ If the two disagree the automations never fire, and nothing reports it: the plan
 e.g. 18kW roughly corresponds to an 80A supply.
 
 *Important:* Earlier versions of this page set **grid_import_limitation** to 0 in both freeze modes. That is no longer recommended (see [batpred#4911](https://github.com/springfall2008/batpred/issues/4911)): the freeze is
-enforced by the charge and discharge cut-offs, not by the import limit, and a 0kW import limit contradicts Freeze Charging's own definition (house load beyond solar is met from the grid).
+enforced by the charge cut-off and Backup SoC, not by the import limit, and a 0kW import limit contradicts Freeze Charging's own definition (house load beyond solar is met from the grid).
 It also stalls a Sigenergy EV charger (EVAC/EVDC) behind the plant's CT clamp, which the plant throttles to the import limit - and one of the times Predbat uses Freeze Charging is to hold the battery while the car charges.
 If you are updating from the older automation, set **number.sigen_plant_grid_import_limitation** back to your supply limit once, as a freeze mode may have left it at 0.
 
-*Important:* Sigenergy have confirmed this is a known firmware bug on their side (not a Predbat or integration issue): even if **grid_import_limitation** is set to 0kW, the inverter will still import from the grid to charge the battery if the current SoC is below **discharge_cut_off_state_of_charge**. In practice this has been observed importing several kW, not just a trickle, when the gap between SoC and the cut-off is large - continuing unattended until the target is reached. **grid_import_limitation** is therefore not a reliable backstop against this: the fix is keeping **discharge_cut_off_state_of_charge** pinned so it's never above current SoC, as the automation above does.
+*Important:* While the grid is up, the plant imports to charge the battery whenever SoC is below the floor it is holding - **backup_state_of_charge** with a Gateway, as Sigenergy's FAQ describes, and **discharge_cut_off_state_of_charge** without one. Sigenergy have confirmed (for the discharge cut-off) that this happens even with **grid_import_limitation** set to 0kW, and it has been observed importing several kW, not just a trickle, when the gap between SoC and the floor is large - continuing unattended until the target is reached. **grid_import_limitation** is therefore not a reliable backstop against this: the fix is keeping the floor pinned so it's never above current SoC, as the automation above does.
 
-The pin is set once, when Freeze Charging starts, rather than continuously updated as SoC changes - and this matters, not just as a simplification. "Frozen" means holding a fixed point; if the target itself kept moving to track live SoC, any downward drift (from real losses or otherwise) would just relocate the target to wherever the battery ended up, with nothing ever correcting it back. A fixed target is what makes the correction mechanism (the same import behaviour that caused the original bug) actually useful: it holds the line against any real deficit, including the inverter's own standby losses, not just customer load. The small margin (0.25 percentage points) below the pinned value exists to cover possible imprecision in that one reading - not ongoing noise tolerance, since the pin is fixed rather than re-sampled, so only the single initial reading matters. (The pin is also re-taken if the automation re-runs during Freeze Charging - after a Home Assistant restart, or when Remote EMS is switched back on - which is a rare, one-off reset rather than continuous tracking.) It still matters because the underlying mechanism only ever corrects one way: a reading that's a hair low at the moment of pinning would cost a real, if tiny, import to "correct" a gap that was never really there, while a reading that's a hair high costs nothing - so even a one-off imprecise read isn't self-cancelling without some margin.
+The pin is set once, when Freeze Charging starts, rather than continuously updated as SoC changes - and this matters, not just as a simplification. "Frozen" means holding a fixed point; if the target itself kept moving to track live SoC, any downward drift (from real losses or otherwise) would just relocate the target to wherever the battery ended up, with nothing ever correcting it back. A fixed target is what makes the correction mechanism (the same import behaviour that caused the original bug) actually useful: it holds the line against any real deficit, including the inverter's own standby losses, not just customer load. The small margin (0.2 percentage points) below the pinned value exists to cover possible imprecision in that one reading - not ongoing noise tolerance, since the pin is fixed rather than re-sampled, so only the single initial reading matters. (The pin is also re-taken if the automation re-runs during Freeze Charging - after a Home Assistant restart, or when Remote EMS is switched back on - which is a rare, one-off reset rather than continuous tracking.) It still matters because the underlying mechanism only ever corrects one way: a reading that's a hair low at the moment of pinning would cost a real, if tiny, import to "correct" a gap that was never really there, while a reading that's a hair high costs nothing - so even a one-off imprecise read isn't self-cancelling without some margin.
 
-The margin is clamped at 0 (`[value, 0] | max`) rather than allowed to go negative. This isn't just tidiness: `discharge_cut_off_state_of_charge` is an unsigned 16-bit Modbus register on the wire, and the integration's own write encoding has no guard against a negative value - it would silently wrap around into a huge, nonsensical raw value rather than being rejected. At very low SoC (below the margin) an unclamped template could produce exactly that.
+The pinned value is never below **input_number.predbat_set_reserve_min** (`[value, min_reserve] | max`), the level Backup SoC sits at in every other mode, so a freeze at low SoC holds the battery no lower than the reserve. This also keeps the value from going negative, which matters: `backup_state_of_charge` is an unsigned 16-bit Modbus register on the wire with a resolution of 0.1%, and the integration's own write encoding has no guard against a negative value - it would silently wrap around into a huge, nonsensical raw value rather than being rejected. The value is rounded to 0.1% to match the register.
 
 See [batpred#4375](https://github.com/springfall2008/batpred/issues/4375) and the wider [Sigenergy setup discussion](https://github.com/springfall2008/batpred/issues/2077) for the full investigation, including a more advanced (currently experimental, untested) variant that ratchets the target up in response to confirmed solar surplus over each period rather than using a fixed one-off value.
 
