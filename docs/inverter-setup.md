@@ -1955,7 +1955,8 @@ so none of the mode changes made by the automations below take effect. The cut-o
       The plant keeps the discharge cut-off at or below Backup SoC, and raises Backup SoC itself if the cut-off is set above it.
 
     Using Backup SoC this way needs a **Sigen Gateway**: without one, Sigenergy say the battery stops on-grid discharging at the discharge cut-off, and Backup SoC has no effect.
-    Without a Gateway, use **number.sigen_plant_ess_discharge_cut_off_state_of_charge** in place of **number.sigen_plant_ess_backup_state_of_charge** in the mode automation and in `apps.yaml`.
+    Without a Gateway, change `soc_floor` at the top of the mode automation, and `reserve:` in `apps.yaml`, to **number.sigen_plant_ess_discharge_cut_off_state_of_charge**.
+    The freeze is then applied to the discharge cut-off, which is the on-grid floor on such a plant, and the cut-off is returned to your reserve afterwards.
 
 - If you are updating from an earlier version of this page, whose automation pinned the discharge cut-off for Freeze Charging: set **number.sigen_plant_ess_discharge_cut_off_state_of_charge** back to your outage floor once,
   as the old automation left it at 0. Backup SoC needs no manual fix: the new automation sets it back to your reserve on the next mode change.
@@ -2020,6 +2021,11 @@ Add the following automations to `automations.yaml` (or configure via the UI):
         - switch.sigen_plant_remote_ems_controlled_by_home_assistant
       from: "off"
       to: "on"
+  # The SoC floor Predbat's freeze is applied to. With a Sigen Gateway this is Backup SoC. Without one,
+  # Backup SoC has no effect while the grid is up: change this to
+  # number.sigen_plant_ess_discharge_cut_off_state_of_charge (and the reserve: entry in apps.yaml to match)
+  variables:
+    soc_floor: number.sigen_plant_ess_backup_state_of_charge
   conditions: []
   actions:
     # After a restart, give the Sigenergy integration time to load before writing to it
@@ -2042,9 +2048,9 @@ Add the following automations to `automations.yaml` (or configure via the UI):
              else "Maximum Self Consumption" if is_state('input_select.predbat_requested_mode', "Freeze Charging")
              else "Command Discharging (PV First)" if is_state('input_select.predbat_requested_mode', "Discharging")
              else "Maximum Self Consumption" }}
-    # The SoC floors used below:
-    #  - backup_state_of_charge is the floor while the grid is up (with a Sigen Gateway). Predbat's freeze
-    #    is applied here, and it is otherwise kept at input_number.predbat_set_reserve_min.
+    # The SoC floors (with a Sigen Gateway):
+    #  - backup_state_of_charge (soc_floor) is the floor while the grid is up. Predbat's freeze is applied
+    #    here, and it is otherwise kept at input_number.predbat_set_reserve_min.
     #  - discharge_cut_off_state_of_charge is the floor in a grid outage. These automations never write it:
     #    set it once, to the lowest level you want the battery to reach in an outage.
     # The plant keeps discharge cut-off <= backup SoC, and raises backup SoC itself when the cut-off is set
@@ -2059,7 +2065,7 @@ Add the following automations to `automations.yaml` (or configure via the UI):
         #  power above the house load, the excess solar will be used to charge the battery
         # In Sigenergy, this is effectively "self consumption" mode with discharging prohibited
         #
-        # backup_state_of_charge is pinned once here, to current SoC minus a small margin, and never
+        # soc_floor is pinned once here, to current SoC minus a small margin, and never
         # below predbat_set_reserve_min. With the grid up the plant imports to bring the battery back up
         # to backup SoC, so the target must never sit above SoC - see the notes after this automation.
         # If the grid fails, the battery can still discharge down to the discharge cut-off.
@@ -2075,13 +2081,13 @@ Add the following automations to `automations.yaml` (or configure via the UI):
                 value: 100
             - action: number.set_value
               target:
-                entity_id: number.sigen_plant_ess_backup_state_of_charge
+                entity_id: "{{ soc_floor }}"
               data:
                 # If predbat_set_reserve_min can't be read, the current backup SoC is kept; if SoC can't be
                 # read, backup SoC is set to the reserve (no discharge block) - never to a guessed high value
                 value: >-
-                  {% set current_backup = states('number.sigen_plant_ess_backup_state_of_charge') | float(0) %}
-                  {% set min_reserve = states('input_number.predbat_set_reserve_min') | float(current_backup) %}
+                  {% set current_floor = states(soc_floor) | float(0) %}
+                  {% set min_reserve = states('input_number.predbat_set_reserve_min') | float(current_floor) %}
                   {% set soc = states('sensor.sigen_plant_battery_state_of_charge') | float(none) %}
                   {% if soc is not none %}{{ [soc - 0.2, min_reserve] | max | round(1) }}{% else %}{{ min_reserve }}{% endif %}
         # grid_import_limitation is deliberately not set to 0 in either freeze mode - see the note
@@ -2113,12 +2119,12 @@ Add the following automations to `automations.yaml` (or configure via the UI):
                 value: 0
             - action: number.set_value
               target:
-                entity_id: number.sigen_plant_ess_backup_state_of_charge
+                entity_id: "{{ soc_floor }}"
               data:
                 value: >-
-                  {% set current_backup = states('number.sigen_plant_ess_backup_state_of_charge') | float(0) %}
-                  {{ states('input_number.predbat_set_reserve_min') | float(current_backup) }}
-        # Any other mode: clear the freeze, return backup SoC to the reserve and restore the import limit
+                  {% set current_floor = states(soc_floor) | float(0) %}
+                  {{ states('input_number.predbat_set_reserve_min') | float(current_floor) }}
+        # Any other mode: clear the freeze, return the floor to the reserve and restore the import limit
         - conditions:
           - condition: not
             conditions:
@@ -2136,11 +2142,11 @@ Add the following automations to `automations.yaml` (or configure via the UI):
                 value: 100
             - action: number.set_value
               target:
-                entity_id: number.sigen_plant_ess_backup_state_of_charge
+                entity_id: "{{ soc_floor }}"
               data:
                 value: >-
-                  {% set current_backup = states('number.sigen_plant_ess_backup_state_of_charge') | float(0) %}
-                  {{ states('input_number.predbat_set_reserve_min') | float(current_backup) }}
+                  {% set current_floor = states(soc_floor) | float(0) %}
+                  {{ states('input_number.predbat_set_reserve_min') | float(current_floor) }}
             - action: number.set_value
               target:
                 entity_id: number.sigen_plant_grid_import_limitation
