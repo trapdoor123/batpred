@@ -2061,7 +2061,7 @@ Add the following automations to `automations.yaml` (or configure via the UI):
         # Docs:
         #  Freeze charging - The battery is charging but the current battery level (SoC) is frozen (held). Think of it
         #  as a charge to the current battery level. The grid or solar covers any house load. If there is a shortfall of
-        #  Solar power to meet house load, the excess house load is met from grid import, but if there is excess Solar
+        #  solar power to meet house load, the excess house load is met from grid import, but if there is excess solar
         #  power above the house load, the excess solar will be used to charge the battery
         # In Sigenergy, this is effectively "self consumption" mode with discharging prohibited
         #
