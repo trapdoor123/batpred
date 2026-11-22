@@ -1900,6 +1900,11 @@ Add the following automations to `automations.yaml` (or configure via the UI):
     soc_floor: number.sigen_plant_ess_backup_state_of_charge
   conditions: []
   actions:
+    # Predbat sends some mode changes as a pair in the same cycle, e.g. Demand then Discharging to start an
+    # export after a charge or freeze (its "stop charging" and "start exporting" calls both set this one
+    # input_select). In restart mode this delay lets the second cancel the first before it writes anything,
+    # so only the final mode reaches the plant and the two runs' writes never overlap on the Modbus link.
+    - delay: "00:00:02"
     # After a restart, give the Sigenergy integration time to load before writing to it
     - wait_template: >-
         {{ states('select.sigen_plant_remote_ems_control_mode') not in ['unknown', 'unavailable']
@@ -2103,6 +2108,8 @@ If the two disagree the automations never fire, and nothing reports it: the plan
 Predbat sets **input_number.discharge_rate** to 0 and the house is supplied from the grid. Solar can still charge the battery (except during Freeze Exporting, which stops charging), and the discharge rate goes back to maximum once the SoC is more than 2% above the reserve.
 The SoC is only checked every 5 minutes, so with a large house load the battery can still go a little below the reserve before the hold starts.
 Predbat only does this while it controls the charge or export windows, not in Monitor or Control SOC only mode. It relies on the discharge rate automation above. Without it the plant's own self-consumption carries on running the house from the battery down to **number.sigen_plant_ess_discharge_cut_off_state_of_charge** (see [batpred#5358](https://github.com/springfall2008/batpred/issues/5358)).
+With a Sigen Gateway, the mode automation above also keeps **number.sigen_plant_ess_backup_state_of_charge** at **set_reserve_min** outside Freeze Charging, so the plant itself stops discharging at the reserve straight away and the discharge rate hold is a second safeguard.
+Without a Gateway, Backup SoC has no effect while the grid is up and the discharge rate hold is what keeps the reserve.
 
 *Important:* Depending upon your electricity supply, you may need to change where **number.sigen_plant_grid_import_limitation** is set to 100 in the first automation to any lower import limit that your electricity supplier may have imposed,
 e.g. 18kW roughly corresponds to an 80A supply.
